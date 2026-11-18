@@ -1,0 +1,14 @@
+streamlit>=1.36
+openai>=1.40
+edge-tts>=6.1
+pydantic>=2.0
+python-dotenv>=1.0
+pillow>=10.0
+torch>=2.1
+transformers>=4.40
+diffusers>=0.27
+opencv-python-headless>=4.8,<5
+numpy>=1.26
+scipy>=1.11
+soundfile>=0.12
+pretty_midi>=0.2.10
