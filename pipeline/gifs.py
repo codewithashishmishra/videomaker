@@ -7,7 +7,24 @@ import re
 import subprocess
 from pathlib import Path
 
-from pipeline.config import DYNAMIC_FPS, FRAME_H, FRAME_W
+from pipeline.config import DYNAMIC_FPS, FRAME_H, FRAME_W, GIF_PLAY_ONCE
+
+
+def gif_duration_sec(gif_path: Path) -> float:
+    """Natural playthrough length of an animated GIF (one cycle, seconds)."""
+    from PIL import Image
+
+    path = Path(gif_path)
+    with Image.open(path) as im:
+        n = getattr(im, "n_frames", 1) or 1
+        total_ms = 0
+        for i in range(n):
+            im.seek(i)
+            # PIL duration is per-frame ms; default 100 if missing.
+            total_ms += int(im.info.get("duration") or 100)
+        if total_ms <= 0:
+            total_ms = n * 100
+    return max(0.2, total_ms / 1000.0)
 
 
 def _parse_motion(gif_motion: str) -> dict:
@@ -97,19 +114,48 @@ def mux_gif_with_audio(
     duration: float,
     out_mp4: Path,
     *,
+    play_once: bool | None = None,
+    frame_w: int | None = None,
+    frame_h: int | None = None,
     log=print,
 ) -> Path:
-    """Loop a scene GIF for the VO length, mux audio → timed mp4 clip."""
+    """GIF → mp4 with VO. Default: play GIF once (no stream-loop)."""
     gif_path = Path(gif_path)
     audio_path = Path(audio_path)
     out_mp4 = Path(out_mp4)
     out_mp4.parent.mkdir(parents=True, exist_ok=True)
+    once = GIF_PLAY_ONCE if play_once is None else bool(play_once)
+    gif_dur = gif_duration_sec(gif_path)
+    # With VO, clip length follows audio; if play_once, freeze last frame rather than loop GIF.
     dur = max(0.4, float(duration))
-    log(f"Merge GIF→video clip ({dur:.1f}s): {gif_path.name}")
-    subprocess.run(
-        [
-            "ffmpeg",
-            "-y",
+    w = int(frame_w or FRAME_W)
+    h = int(frame_h or FRAME_H)
+    vf = (
+        f"scale={w}:{h}:force_original_aspect_ratio=increase:flags=lanczos,"
+        f"crop={w}:{h},fps={DYNAMIC_FPS},format=yuv420p"
+    )
+    cmd = ["ffmpeg", "-y"]
+    if once:
+        # Play GIF once, then hold last frame until audio ends (no frame-repeat loop).
+        pad = max(0.0, dur - gif_dur)
+        log(f"Merge GIF→video ONCE ({gif_dur:.2f}s + {pad:.2f}s hold): {gif_path.name}")
+        cmd += [
+            "-i",
+            str(gif_path),
+            "-i",
+            str(audio_path),
+            "-filter_complex",
+            f"[0:v]{vf},tpad=stop_mode=clone:stop_duration={pad:.3f}[v]",
+            "-map",
+            "[v]",
+            "-map",
+            "1:a:0",
+            "-t",
+            f"{dur:.3f}",
+        ]
+    else:
+        log(f"Merge GIF→video looped ({dur:.1f}s): {gif_path.name}")
+        cmd += [
             "-stream_loop",
             "-1",
             "-i",
@@ -119,25 +165,23 @@ def mux_gif_with_audio(
             "-t",
             f"{dur:.3f}",
             "-vf",
-            f"scale={FRAME_W}:{FRAME_H}:force_original_aspect_ratio=increase,"
-            f"crop={FRAME_W}:{FRAME_H},fps={DYNAMIC_FPS},format=yuv420p",
-            "-c:v",
-            "libx264",
-            "-preset",
-            "veryfast",
-            "-crf",
-            "20",
-            "-c:a",
-            "aac",
-            "-b:a",
-            "192k",
-            "-shortest",
-            str(out_mp4),
-        ],
-        check=True,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
+            vf,
+        ]
+    cmd += [
+        "-c:v",
+        "libx264",
+        "-preset",
+        "medium",
+        "-crf",
+        "17",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "192k",
+        "-shortest",
+        str(out_mp4),
+    ]
+    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     return out_mp4
 
 
@@ -146,18 +190,32 @@ def mux_gif_silent(
     duration: float,
     out_mp4: Path,
     *,
+    play_once: bool | None = None,
+    frame_w: int | None = None,
+    frame_h: int | None = None,
     log=print,
 ) -> Path:
-    """Loop a scene GIF for ``duration`` seconds → silent mp4 (no audio track)."""
+    """GIF → silent mp4. Default: play the GIF exactly once (video-like, no loop)."""
     gif_path = Path(gif_path)
     out_mp4 = Path(out_mp4)
     out_mp4.parent.mkdir(parents=True, exist_ok=True)
-    dur = max(0.4, float(duration))
-    log(f"Merge GIF→silent clip ({dur:.1f}s): {gif_path.name}")
-    subprocess.run(
-        [
-            "ffmpeg",
-            "-y",
+    once = GIF_PLAY_ONCE if play_once is None else bool(play_once)
+    gif_dur = gif_duration_sec(gif_path)
+    # When play-once, ignore padded scene duration — one clean playthrough.
+    dur = gif_dur if once else max(0.4, float(duration))
+    w = int(frame_w or FRAME_W)
+    h = int(frame_h or FRAME_H)
+    vf = (
+        f"scale={w}:{h}:force_original_aspect_ratio=increase:flags=lanczos,"
+        f"crop={w}:{h},fps={DYNAMIC_FPS},format=yuv420p"
+    )
+    cmd = ["ffmpeg", "-y"]
+    if once:
+        log(f"Merge GIF→silent ONCE ({dur:.2f}s, no loop): {gif_path.name}")
+        cmd += ["-i", str(gif_path), "-t", f"{dur:.3f}", "-vf", vf]
+    else:
+        log(f"Merge GIF→silent looped ({dur:.1f}s): {gif_path.name}")
+        cmd += [
             "-stream_loop",
             "-1",
             "-i",
@@ -165,19 +223,17 @@ def mux_gif_silent(
             "-t",
             f"{dur:.3f}",
             "-vf",
-            f"scale={FRAME_W}:{FRAME_H}:force_original_aspect_ratio=increase,"
-            f"crop={FRAME_W}:{FRAME_H},fps={DYNAMIC_FPS},format=yuv420p",
-            "-an",
-            "-c:v",
-            "libx264",
-            "-preset",
-            "veryfast",
-            "-crf",
-            "20",
-            str(out_mp4),
-        ],
-        check=True,
-        stdout=subprocess.DEVNULL,
-        stderr=subprocess.DEVNULL,
-    )
+            vf,
+        ]
+    cmd += [
+        "-an",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "medium",
+        "-crf",
+        "17",
+        str(out_mp4),
+    ]
+    subprocess.run(cmd, check=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
     return out_mp4

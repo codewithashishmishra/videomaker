@@ -22,6 +22,7 @@ from pipeline.config import (
     NEG_STYLE,
     OPENAI_GIF_FRAME_COUNT,
     OPENAI_GIF_FRAME_MS,
+    OPENAI_GIF_QUALITY,
     OPENAI_GIF_SIZE,
     OPENAI_IMAGE_MODEL,
     STYLE_LOCK,
@@ -333,7 +334,7 @@ def _draw_one_openai(
 
 
 def _motion_gif_prompt(scene_prompt: str, character_bible: str, gif_motion: str) -> str:
-    """Prompt for a REAL looping animated GIF (subject motion), not a camera pan."""
+    """Prompt for one smooth high-quality motion beat (played once in the video)."""
     action = _words(scene_prompt, 55)
     for prefix in (
         "create an animated disney pixar cartoon gif of",
@@ -343,15 +344,15 @@ def _motion_gif_prompt(scene_prompt: str, character_bible: str, gif_motion: str)
         if action.lower().startswith(prefix):
             action = action[len(prefix) :].lstrip(" :,-")
             break
-    motion = _words(gif_motion or "gentle bob in water, blink, soft splash loops", 28)
+    motion = _words(gif_motion or "gentle bob in water, blink, soft splash", 28)
     return (
-        "Create a looping animated Disney Pixar 3D cartoon GIF with REAL character motion "
-        "(not a camera zoom/pan/tilt). "
+        "Create one smooth high-quality Disney Pixar 3D cartoon animated GIF for a single "
+        "story beat with REAL character motion (not camera zoom/pan/tilt, not a slideshow). "
         f"Scene: {action}. "
         f"Cast lock: {_words(character_bible, 40)}. "
-        f"Motion loop: {motion}. "
-        "Characters bob, blink, water ripples and splash droplets move, floaties sway; "
-        "camera stays mostly still; return to the starting pose for a smooth loop. "
+        f"Motion: {motion}. "
+        "Smooth continuous animation: characters bob, blink, water ripples, splash droplets, "
+        "floaties sway; camera mostly still; fluid high-fidelity motion between frames. "
         "Bright sunny pool, turquoise water, expressive faces, family friendly."
     )
 
@@ -364,38 +365,64 @@ def generate_openai_motion_gif(
     character_ref: Path | None = None,
     frame_count: int | None = None,
     frame_duration_ms: int | None = None,
+    gif_size: str | None = None,
     log=print,
 ) -> Path:
-    """Native OpenAI animated GIF — subject motion like ChatGPT GIFs."""
+    """Native OpenAI animated GIF — subject motion like ChatGPT GIFs (high quality)."""
     n_frames = max(2, min(16, int(frame_count or OPENAI_GIF_FRAME_COUNT)))
     frame_ms = max(20, min(2000, int(frame_duration_ms or OPENAI_GIF_FRAME_MS)))
-    gif_kwargs = {
-        "output_format": "gif",
-        "frame_count": n_frames,
-        "frame_duration_ms": frame_ms,
-        "size": OPENAI_GIF_SIZE,
-        "quality": "medium",
-    }
-    log(
-        f"OpenAI native GIF ({n_frames} frames × {frame_ms}ms ≈ "
-        f"{n_frames * frame_ms / 1000:.1f}s loop)..."
-    )
+    preferred = (gif_size or OPENAI_GIF_SIZE).strip()
+    # Prefer locked format size first so every beat matches the final video canvas.
+    sizes: list[str] = []
+    for s in (preferred, "auto", "1024x576", "1024x1024", "720x1280", "1280x720"):
+        if s and s not in sizes:
+            sizes.append(s)
+    qualities: list[str] = []
+    for q in (OPENAI_GIF_QUALITY, "high", "medium"):
+        if q and q not in qualities:
+            qualities.append(q)
     result = None
     last_err: Exception | None = None
-    if character_ref is not None and Path(character_ref).is_file():
-        try:
-            result = _edit_image(client, prompt, Path(character_ref), **gif_kwargs)
-        except Exception as exc:
-            last_err = exc
-            log(f"  GIF edit failed ({exc}); falling back to generate...")
+    for quality in qualities:
+        for size in sizes:
+            gif_kwargs = {
+                "output_format": "gif",
+                "frame_count": n_frames,
+                "frame_duration_ms": frame_ms,
+                "size": size,
+                "quality": quality,
+            }
+            log(
+                f"OpenAI native GIF ({n_frames}×{frame_ms}ms ≈ "
+                f"{n_frames * frame_ms / 1000:.1f}s once, q={quality}, {size})..."
+            )
+            try:
+                if character_ref is not None and Path(character_ref).is_file():
+                    try:
+                        result = _edit_image(
+                            client, prompt, Path(character_ref), **gif_kwargs
+                        )
+                    except Exception as edit_exc:
+                        last_err = edit_exc
+                        result = _generate_image(client, prompt, **gif_kwargs)
+                else:
+                    result = _generate_image(client, prompt, **gif_kwargs)
+            except Exception as exc:
+                last_err = exc
+                result = None
+                # Stop immediately on billing / quota errors.
+                msg = str(exc).lower()
+                if "429" in msg or "credit" in msg or "quota" in msg:
+                    raise RuntimeError(f"OpenAI animated GIF failed: {exc}") from exc
+                continue
+            if result is not None:
+                break
+        if result is not None:
+            break
     if result is None:
-        try:
-            result = _generate_image(client, prompt, **gif_kwargs)
-        except Exception as exc:
-            raise RuntimeError(f"OpenAI animated GIF failed: {exc}") from (last_err or exc)
+        raise RuntimeError(f"OpenAI animated GIF failed: {last_err}")
     out_gif = Path(out_gif)
     _save_b64_bytes(_extract_image_b64(result), out_gif)
-    # Freeze first frame as PNG beside gifs/ (images/scene_XX.png).
     try:
         from PIL import Image
 
@@ -409,7 +436,7 @@ def generate_openai_motion_gif(
             im.convert("RGB").save(still_path)
     except Exception:
         pass
-    log(f"  Saved native GIF {out_gif.name}")
+    log(f"  Saved native GIF {out_gif.name} (play once in final video)")
     return out_gif
 
 
@@ -492,11 +519,15 @@ def generate_scene_stills(
     progress=None,
     *,
     use_openai: bool | None = None,
+    gif_size: str | None = None,
+    frame_count: int | None = None,
+    frame_duration_ms: int | None = None,
 ) -> list[dict]:
     """Kids path: character ref → native OpenAI motion GIFs (or local fallback) → merge.
 
     OpenAI path uses ``output_format=gif`` with real subject motion (bob/blink/splash),
     matching ChatGPT animated GIFs — NOT Ken Burns zoom/pan.
+    All GIFs share the same ``gif_size`` (reel or youtube) as the final video.
     """
     from pipeline.progress import emit
 
@@ -506,9 +537,13 @@ def generate_scene_stills(
     total = len(scenes)
     _ = animation_mode, global_dance
     openai_on = USE_OPENAI_IMAGES if use_openai is None else bool(use_openai)
+    size_lock = (gif_size or OPENAI_GIF_SIZE).strip()
 
     if openai_on:
-        log("Step 2/3 — OpenAI native animated GIFs (real motion, no zoom/pan)...")
+        log(
+            f"Step 2/3 — OpenAI native animated GIFs @ {size_lock} "
+            "(real motion, play-once, no zoom/pan)..."
+        )
     else:
         log("Step 2/3 — local stills + soft motion GIFs...")
 
@@ -517,7 +552,7 @@ def generate_scene_stills(
             idx = s["idx"]
             out_path = out_dir / f"scene_{idx:02d}.png"
             gif_path = gif_dir / f"scene_{idx:02d}.gif"
-            log(f"Story GIF beat {idx + 1}/{total}...")
+            log(f"Story GIF beat {idx + 1}/{total} @ {size_lock}...")
             if openai_on:
                 if client is None:
                     raise RuntimeError("OpenAI client required when OpenAI Images is enabled")
@@ -531,6 +566,9 @@ def generate_scene_stills(
                     prompt=gif_prompt,
                     out_gif=gif_path,
                     character_ref=character_ref,
+                    frame_count=frame_count,
+                    frame_duration_ms=frame_duration_ms,
+                    gif_size=size_lock,
                     log=log,
                 )
                 if not out_path.is_file() and character_ref.is_file():
@@ -559,7 +597,21 @@ def generate_scene_stills(
             s["character_ref"] = str(character_ref)
             s["pose_images"] = [s["image"]]
             s["native_openai_gif"] = bool(openai_on)
-            log(f"  Saved {gif_path.name}")
+            # Natural GIF length (play-once). Keep TTS duration for VO mux; silent uses gif len.
+            try:
+                from pipeline.gifs import gif_duration_sec
+
+                s["gif_duration"] = gif_duration_sec(gif_path)
+                if not s.get("audio"):
+                    s["duration"] = s["gif_duration"]
+            except Exception:
+                s["gif_duration"] = float(s.get("duration") or 2.0)
+            log(
+                f"  Saved {gif_path.name} "
+                f"(gif {s.get('gif_duration', '?')}s once"
+                + (f", vo {s.get('duration')}s" if s.get("audio") else "")
+                + ")"
+            )
             emit(
                 progress,
                 "images",

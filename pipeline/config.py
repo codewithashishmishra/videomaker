@@ -14,11 +14,13 @@ TASKS_INDEX = OUTPUTS_DIR / "tasks_index.json"
 Language = Literal["hindi", "english"]
 AnimationMode = Literal["static", "dynamic"]
 ContentMode = Literal["story", "system_design"]
+VideoFormat = Literal["youtube", "reel"]
 Emotion = Literal["happy", "excited", "calm", "sad", "suspense", "outro"]
 
 MIN_DURATION_SEC = 1
 MAX_DURATION_SEC = 300  # 5 minutes
 
+# Default export = YouTube landscape; reel overrides via resolve_video_format().
 FRAME_W = 1280
 FRAME_H = 720
 STILL_W = 1024
@@ -26,6 +28,42 @@ STILL_H = 576
 FPS = 24
 # Smooth talking-head / dynamic export (SadTalker remux target).
 DYNAMIC_FPS = 25
+
+# Consistent canvas for OpenAI GIFs + final mux (multiples of 16 for Image API).
+VIDEO_FORMATS: dict[str, dict] = {
+    "youtube": {
+        "label": "YouTube / fullscreen (16:9)",
+        "frame_w": 1280,
+        "frame_h": 720,
+        "gif_size": "1280x720",
+        "aspect": "16:9",
+    },
+    "reel": {
+        "label": "Reel / Shorts (9:16)",
+        "frame_w": 720,
+        "frame_h": 1280,
+        "gif_size": "720x1280",
+        "aspect": "9:16",
+    },
+}
+
+
+def resolve_video_format(video_format: str | None) -> dict:
+    """Return size lock for GIFs + final video (same WxH end-to-end)."""
+    key = (video_format or "youtube").strip().lower()
+    if key not in VIDEO_FORMATS:
+        key = "youtube"
+    return {"key": key, **VIDEO_FORMATS[key]}
+
+
+def gif_timing_for_scenes(duration_sec: float, n_scenes: int) -> tuple[int, int]:
+    """Pick frame_count / frame_ms so each GIF plays once ~duration/n_scenes."""
+    n = max(1, int(n_scenes))
+    target = max(1.2, float(duration_sec) / n)
+    frames = 16
+    ms = int(round((target * 1000.0) / frames))
+    ms = max(80, min(400, ms))
+    return frames, ms
 
 STORY_MODEL = "gpt-4o-mini"
 # Larger model for big system-design Mermaid architectures (text only — no image API).
@@ -52,10 +90,24 @@ IMAGE_FALLBACK_MODELS = (
     "gpt-image-2",
     "gpt-image-1.5",
 )
-# Native OpenAI animated GIF settings (real character motion — not Ken Burns).
-OPENAI_GIF_FRAME_COUNT = int(os.environ.get("OPENAI_GIF_FRAME_COUNT", "12"))
-OPENAI_GIF_FRAME_MS = int(os.environ.get("OPENAI_GIF_FRAME_MS", "160"))
-OPENAI_GIF_SIZE = os.environ.get("OPENAI_GIF_SIZE", "1024x576").strip() or "1024x576"
+# Native OpenAI animated GIF — smooth subject motion, played ONCE in the final video.
+OPENAI_GIF_FRAME_COUNT = int(os.environ.get("OPENAI_GIF_FRAME_COUNT", "16"))
+OPENAI_GIF_FRAME_MS = int(os.environ.get("OPENAI_GIF_FRAME_MS", "125"))
+# Overridden per-run by video_format (youtube/reel) so all GIFs share one size.
+OPENAI_GIF_SIZE = os.environ.get("OPENAI_GIF_SIZE", "1280x720").strip() or "1280x720"
+OPENAI_GIF_QUALITY = os.environ.get("OPENAI_GIF_QUALITY", "high").strip() or "high"
+# Kids rhyme videos from the UI default to OpenAI native animated GIFs.
+STORY_USE_OPENAI_GIFS = os.environ.get("STORY_USE_OPENAI_GIFS", "1").strip().lower() not in {
+    "0",
+    "false",
+    "no",
+}
+# Never stream-loop GIFs in the final cut (one playthrough each).
+GIF_PLAY_ONCE = os.environ.get("GIF_PLAY_ONCE", "1").strip().lower() not in {
+    "0",
+    "false",
+    "no",
+}
 
 # Local Disney/Pixar cartoon stills (default, free after download).
 LOCAL_IMAGE_MODEL = "stablediffusionapi/disney-pixar-cartoon"

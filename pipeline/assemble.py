@@ -509,9 +509,12 @@ def assemble_final(
     content_mode: str = "story",
     title: str = "System Design",
     silent: bool = False,
+    frame_w: int | None = None,
+    frame_h: int | None = None,
     log=print,
     progress=None,
 ) -> Path:
+    from pipeline.config import FRAME_H, FRAME_W
     from pipeline.diagrams import render_scene_clip_diagram_live
     from pipeline.progress import emit
 
@@ -521,6 +524,8 @@ def assemble_final(
     dynamic = animation_mode == "dynamic"
     is_diagram = content_mode == "system_design"
     silent = bool(silent)
+    fw = int(frame_w or FRAME_W)
+    fh = int(frame_h or FRAME_H)
 
     for s in scenes:
         clip = out_dir / f"synced_scene_{s['idx']:02d}.mp4"
@@ -555,12 +560,20 @@ def assemble_final(
         elif s.get("gif") and Path(s["gif"]).is_file():
             # Kids rhyme path: merge motion GIFs → timed clips.
             if silent:
-                from pipeline.gifs import mux_gif_silent
+                from pipeline.gifs import gif_duration_sec, mux_gif_silent
 
+                # Always use natural GIF length when play-once (no repeated cycles).
+                try:
+                    s["duration"] = gif_duration_sec(Path(s["gif"]))
+                except Exception:
+                    pass
                 mux_gif_silent(
                     Path(s["gif"]),
                     float(s["duration"]),
                     clip,
+                    play_once=True,
+                    frame_w=fw,
+                    frame_h=fh,
                     log=log,
                 )
             else:
@@ -571,6 +584,9 @@ def assemble_final(
                     Path(s["audio"]),
                     float(s["duration"]),
                     clip,
+                    play_once=True,
+                    frame_w=fw,
+                    frame_h=fh,
                     log=log,
                 )
         elif dynamic:

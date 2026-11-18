@@ -13,14 +13,18 @@ from pipeline.assemble import assemble_final
 from pipeline.config import (
     OUTPUTS_DIR,
     STORY_TIMEOUT_SEC,
+    STORY_USE_OPENAI_GIFS,
     USE_OPENAI_IMAGES,
     AnimationMode,
     ContentMode,
     Language,
+    VideoFormat,
     clamp_duration_sec,
     detect_content_mode,
+    gif_timing_for_scenes,
     load_env_file,
     prompt_wants_dance,
+    resolve_video_format,
 )
 from pipeline.face_detect import has_human_face
 from pipeline.images import (
@@ -98,13 +102,17 @@ def run_pipeline(
     max_scenes_override: int | None = None,
     silent: bool = False,
     use_openai_images: bool | None = None,
+    video_format: VideoFormat | str = "youtube",
     progress: ProgressCb | None = None,
 ) -> dict:
     """Run the full video pipeline. Returns paths and metadata.
 
-    Duration: pass ``duration_sec`` (1–300) or legacy ``minutes`` (converted to seconds).
-    Content: ``story`` (kids musical) or ``system_design`` (architecture explainer).
-    Kids GIF flow: character reference → multiple 8–10s story GIFs → merge video.
+    Kids animated rhyme flow (production):
+      character ref → OpenAI native motion GIFs (same size) → play-once merge
+      + voice-over TTS + background music.
+
+    ``silent=True`` is POC-only (no VO / no music).
+    ``video_format``: ``youtube`` (16:9) or ``reel`` (9:16) — locks GIF + final WxH.
     """
     load_env_file()
     cb = progress or _default_progress
@@ -121,14 +129,21 @@ def run_pipeline(
     else:
         content_mode = "system_design" if content_mode == "system_design" else "story"
 
+    fmt = resolve_video_format(str(video_format or "youtube"))
+    frame_w, frame_h = int(fmt["frame_w"]), int(fmt["frame_h"])
+    gif_size = str(fmt["gif_size"])
+
     import os
 
     key = (api_key or os.environ.get("OPENAI_API_KEY") or "").strip()
     if not key:
         raise RuntimeError("Missing OPENAI_API_KEY. Add it to .env")
 
-    # Kids stories: allow forcing OpenAI Images (ChatGPT-quality stills) per run.
-    openai_imgs = USE_OPENAI_IMAGES if use_openai_images is None else bool(use_openai_images)
+    # Kids animated videos: OpenAI native GIFs by default (POC / ChatGPT-quality path).
+    if use_openai_images is None:
+        openai_imgs = bool(STORY_USE_OPENAI_GIFS or USE_OPENAI_IMAGES) if content_mode == "story" else False
+    else:
+        openai_imgs = bool(use_openai_images)
     if content_mode == "system_design":
         openai_imgs = False  # SD stays Mermaid-only
 
@@ -140,24 +155,21 @@ def run_pipeline(
     dance = content_mode == "story" and prompt_wants_dance(prompt, title_hint or "")
 
     mode_label = (
-        "system-design explainer" if content_mode == "system_design" else "musical story"
+        "system-design explainer" if content_mode == "system_design" else "animated rhyme story"
     )
     if content_mode == "story" and openai_imgs:
         emit(
             cb,
             "story",
-            f"OpenAI Images on. Writing {mode_label} ({duration_sec}s) — "
-            "character ref → 8–10s GIF beats → merge...",
+            f"OpenAI animated GIFs · {fmt['label']} ({gif_size}) · {duration_sec}s — "
+            "character ref → motion GIFs (play-once) → "
+            + ("silent merge" if silent else "VO + music merge")
+            + "...",
         )
     elif content_mode == "story":
-        emit(
-            cb,
-            "story",
-            f"Writing {mode_label} ({duration_sec}s; images local; set use_openai_images=True for ChatGPT-quality)...",
-        )
+        emit(cb, "story", f"Writing {mode_label} ({duration_sec}s; local images)...")
     else:
         emit(cb, "story", f"Writing {mode_label} ({duration_sec}s)...")
-
     plan: StoryPlan = generate_story(
         client,
         user_topic=prompt,
@@ -275,11 +287,14 @@ def run_pipeline(
             diagrams=diagrams_payload,
         )
     else:
+        gif_frames, gif_ms = gif_timing_for_scenes(duration_sec, len(scenes))
         emit(
             cb,
             "images",
-            "Creating character reference, then 8–10s story GIFs"
-            + (" (OpenAI Images)" if openai_imgs else " (local)..."),
+            f"Character ref → OpenAI motion GIFs @ {gif_size} "
+            f"({gif_frames}×{gif_ms}ms ≈ {gif_frames * gif_ms / 1000:.1f}s each, play-once)"
+            if openai_imgs
+            else "Creating character + local scene stills...",
         )
         char_ref = generate_character_reference(
             client if openai_imgs else None,
@@ -289,7 +304,8 @@ def run_pipeline(
             use_openai=openai_imgs,
         )
 
-        if animation_mode == "dynamic" and not silent:
+        # OpenAI GIF path replaces SadTalker for kids animated cartoons.
+        if animation_mode == "dynamic" and not silent and not openai_imgs:
             talking_portrait = generate_talking_portrait(
                 client if openai_imgs else None,
                 plan.character_bible_en,
@@ -317,6 +333,9 @@ def run_pipeline(
             log=lambda m: emit(cb, "images", m),
             progress=cb,
             use_openai=openai_imgs,
+            gif_size=gif_size,
+            frame_count=gif_frames,
+            frame_duration_ms=gif_ms,
         )
         if talking_portrait is not None:
             for s in scenes:
@@ -327,9 +346,10 @@ def run_pipeline(
     if silent:
         emit(cb, "music", "Silent POC: skipping music...")
     else:
-        total_audio = sum(s["duration"] for s in scenes)
+        # Production rhyme videos always get BGM under VO.
+        total_audio = sum(float(s["duration"]) for s in scenes)
         music_seconds = max(total_audio + 1.0, 4.0)
-        emit(cb, "music", "Creating background music...")
+        emit(cb, "music", "Creating background music (required for rhyme videos)...")
         music_path = generate_music(
             prompt=plan.music_prompt,
             mood=plan.mood,
@@ -344,13 +364,12 @@ def run_pipeline(
         cb,
         "assemble",
         (
-            "Merging scene GIFs into silent video..."
+            f"Merging GIFs play-once @ {frame_w}x{frame_h} (silent)..."
             if silent
             else (
-                "Merging scene GIFs into video + syncing music..."
+                f"Merging GIFs play-once @ {frame_w}x{frame_h} + VO + music..."
                 if content_mode == "story"
-                else f"Assembling final video ({animation_mode}, {content_mode}"
-                f"{', dance-enhanced' if dance else ''})..."
+                else f"Assembling final video ({animation_mode}, {content_mode})..."
             )
         ),
     )
@@ -359,11 +378,13 @@ def run_pipeline(
         music_path=music_path,
         out_dir=out_dir,
         final_name="final_story.mp4",
-        animation_mode=animation_mode if not silent else "static",
+        animation_mode="static" if (silent or openai_imgs) else animation_mode,
         global_dance=dance,
         content_mode=content_mode,
         title=plan.title,
         silent=silent,
+        frame_w=frame_w,
+        frame_h=frame_h,
         log=lambda m: emit(cb, "assemble", m),
         progress=cb,
     )
@@ -377,6 +398,10 @@ def run_pipeline(
         "scene_count": len(scenes),
         "animation_mode": animation_mode,
         "content_mode": content_mode,
+        "video_format": fmt["key"],
+        "frame_w": frame_w,
+        "frame_h": frame_h,
+        "gif_size": gif_size,
         "silent": silent,
         "dance": dance,
         "prompt": prompt,

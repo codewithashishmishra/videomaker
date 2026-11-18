@@ -379,26 +379,41 @@ with st.expander("Settings", expanded=False):
             )
         else:
             st.caption(
-                "Kids story = character GIF images + AI motion → merge GIFs into video "
-                "with rhyme VO and synced music (OpenAI does not generate video)."
+                "Kids animated rhyme = OpenAI native motion GIFs (play-once) → "
+                "merge + female VO + background music. Same size for every GIF & final video."
             )
     with s2:
-        style_label = st.radio(
-            "Video style",
-            ["Static / diagram pan", "Dynamic (live build or face motion)"],
-            horizontal=True,
-            key="ui_style",
-        )
         if content_label.startswith("System"):
+            style_label = st.radio(
+                "Video style",
+                ["Static / diagram pan", "Dynamic (live build)"],
+                horizontal=True,
+                key="ui_style_sd",
+            )
             st.caption(
                 "Dynamic = Mermaid live-build (nodes appear as you explain). "
                 "Supports large multi-layer architectures."
             )
-        elif style_label.startswith("Dynamic"):
-            st.caption(
-                "SadTalker when a human-like face is found; else local blink/tail/mouth motion. "
-                + ("SadTalker ready." if sadtalker_ready() else "SadTalker setup needed (cartoon motion still works).")
+        else:
+            style_label = st.radio(
+                "Cartoon video type",
+                ["Animated GIFs (OpenAI · recommended)", "Legacy stills / face motion"],
+                horizontal=True,
+                key="ui_style_story",
             )
+            st.caption(
+                "Animated GIFs = ChatGPT-style character motion, each beat plays once. "
+                "Includes rhyme voice-over + BGM."
+            )
+        size_label = st.radio(
+            "Video size",
+            ["YouTube / fullscreen (16:9)", "Reel / Shorts (9:16)"],
+            horizontal=True,
+            key="ui_video_size",
+        )
+        st.caption(
+            "1280×720 landscape" if size_label.startswith("YouTube") else "720×1280 vertical — all GIFs match."
+        )
     with s3:
         duration_sec = st.select_slider(
             "Duration",
@@ -412,19 +427,35 @@ with st.expander("Settings", expanded=False):
         st.caption("From 1 second to 5 minutes.")
     with s4:
         title_hint = st.text_input("Title (optional)", key="ui_title")
-        prefer_musicgen = st.checkbox("MusicGen", value=True, key="ui_musicgen")
+        prefer_musicgen = st.checkbox(
+            "MusicGen BGM",
+            value=True,
+            key="ui_musicgen",
+            help="Kids rhyme videos always mix background music under the voice-over.",
+        )
         st.caption(
             ("API key OK · " if api_present else "API key missing · ")
-            + "default cost ≈ story tokens only (~$0.05); set USE_OPENAI_IMAGES=1 for paid stills"
+            + (
+                "kids uses OpenAI animated GIFs + VO + music"
+                if not content_label.startswith("System")
+                else "system design = Mermaid only"
+            )
         )
 
 language = "hindi" if language_label.startswith("Hindi") else "english"
-animation_mode = "dynamic" if style_label.startswith("Dynamic") else "static"
 content_mode = "system_design" if content_label.startswith("System") else "story"
+video_format = "reel" if size_label.startswith("Reel") else "youtube"
+if content_mode == "story":
+    # Default: OpenAI native animated GIFs (POC path) + VO + music.
+    use_openai_gifs = not style_label.startswith("Legacy")
+    animation_mode = "dynamic" if style_label.startswith("Legacy") else "static"
+else:
+    use_openai_gifs = False
+    animation_mode = "dynamic" if style_label.startswith("Dynamic") else "static"
 title_hint = (title_hint or "").strip()
 
 prompt = st.chat_input(
-    "Story, or system design (e.g. Low-latency API for 5M users with Redis & Kafka)…",
+    "Kids rhyme story, or system design (e.g. Low-latency API for 5M users)…",
     disabled=not api_present or st.session_state.running,
 )
 if prompt and api_present and not st.session_state.running:
@@ -437,7 +468,9 @@ if prompt and api_present and not st.session_state.running:
                 "content": (
                     "Generating Mermaid explainer…"
                     if content_mode == "system_design"
-                    else "Creating character GIFs, animating motion, merging into video with music…"
+                    else (
+                        f"Creating OpenAI motion GIFs ({video_format}) + rhyme VO + music…"
+                    )
                 ),
                 "kind": "status",
             }
@@ -455,6 +488,7 @@ if prompt and api_present and not st.session_state.running:
             "language": language,
             "content_mode": content_mode,
             "duration_sec": duration_sec,
+            "video_format": video_format,
         }
 
         progress_bar_slot = st.empty()
@@ -521,6 +555,9 @@ if prompt and api_present and not st.session_state.running:
                 prefer_musicgen=prefer_musicgen,
                 animation_mode=animation_mode,
                 content_mode=content_mode,
+                silent=False,
+                use_openai_images=use_openai_gifs if content_mode == "story" else False,
+                video_format=video_format,
                 progress=_on_progress,
             )
             st.session_state.result = meta
@@ -544,7 +581,13 @@ if prompt and api_present and not st.session_state.running:
                     "kind": "result",
                     "content": (
                         f"Ready: {meta.get('title')} · {meta.get('scene_count')} scenes · "
-                        f"{meta.get('animation_mode')} · {meta.get('language')}"
+                        f"{meta.get('video_format') or meta.get('animation_mode')} · "
+                        f"{meta.get('language')}"
+                        + (
+                            f" · {meta.get('frame_w')}x{meta.get('frame_h')}"
+                            if meta.get("frame_w")
+                            else ""
+                        )
                     ),
                     "meta": meta,
                 }
